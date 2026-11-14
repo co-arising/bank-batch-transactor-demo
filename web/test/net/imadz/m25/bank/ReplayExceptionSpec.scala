@@ -1,8 +1,10 @@
 package net.imadz.m25.bank
 
-import akka.actor.typed.scaladsl.adapter._
 import akka.cluster.sharding.typed.scaladsl.ClusterSharding
+import akka.persistence.testkit.PersistenceTestKitPlugin
 import akka.stream.Materializer
+import com.typesafe.config.ConfigFactory
+import java.lang.reflect.Proxy
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -23,11 +25,25 @@ class ReplayExceptionSpec extends AnyFunSuite with BeforeAndAfterAll {
   private var service: BankBatchDemoService = _
 
   override def beforeAll(): Unit = {
-    classicSystem = akka.actor.ActorSystem("replay-test")
+    val config = ConfigFactory.parseString("""
+      akka.actor.provider = local
+      akka.remote.artery.canonical.port = 0
+      akka.cluster.seed-nodes = []
+      akka.persistence.journal.plugin = "akka.persistence.testkit.journal"
+      akka.persistence.snapshot-store.plugin = "akka.persistence.no-snapshot-store"
+      akka.persistence.testkit.events.serialize = true
+    """).withFallback(PersistenceTestKitPlugin.config)
+    classicSystem = akka.actor.ActorSystem("replay-test", config)
     ec = classicSystem.dispatcher
     mat = Materializer(classicSystem)
-    val typedSystem = classicSystem.toTyped
-    service = new BankBatchDemoService(classicSystem, ClusterSharding(typedSystem), mat)
+    // This suite exercises only the in-memory replay path. Fail fast if that
+    // path unexpectedly starts using sharding, rather than starting a cluster.
+    val unusedSharding = Proxy.newProxyInstance(
+      classOf[ClusterSharding].getClassLoader,
+      Array[Class[_]](classOf[ClusterSharding]),
+      (_, method, _) => throw new AssertionError(s"Unexpected sharding call: ${method.getName}")
+    ).asInstanceOf[ClusterSharding]
+    service = new BankBatchDemoService(classicSystem, unusedSharding, mat)
   }
 
   override def afterAll(): Unit = {

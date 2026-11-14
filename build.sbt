@@ -8,7 +8,10 @@ ThisBuild / version := "0.2"
 
 val akkaVersion = "2.6.20"
 
-ThisBuild / resolvers ++= Seq(
+// Opt in to a local Maven candidate repository without changing global sbt settings.
+ThisBuild / resolvers ++= sys.props.get("monarch.repository").toSeq.map(
+  "Monarch candidate" at _
+) ++ Seq(
   "Aliyun" at "https://maven.aliyun.com/repository/public/"
 )
 
@@ -32,8 +35,8 @@ lazy val core = (project in file("core"))
     publish / skip := true,
     libraryDependencies ++= Seq(
       "net.imadz" %% "common-core" % "0.2",
-      "net.imadz" %% "monarch-core" % "0.2",
-      "net.imadz" %% "monarch-persistence" % "0.2",
+      "net.imadz" %% "monarch-core" % "0.2.1",
+      "net.imadz" %% "monarch-persistence" % "0.2.1",
       "com.thesamet.scalapb" %% "scalapb-runtime" % "0.11.14",
     ) ++ akkaDeps ++ Seq(
       "com.typesafe.akka" %% "akka-actor-testkit-typed" % akkaVersion % Test,
@@ -57,10 +60,13 @@ lazy val web = (project in file("web"))
     name := "bank-batch-transactor-web",
     publish / skip := true,
     libraryDependencies ++= akkaDeps ++ Seq(
-      "net.imadz" %% "monarch-persistence" % "0.2",
+      "net.imadz" %% "monarch-persistence" % "0.2.1",
       "com.thesamet.scalapb" %% "scalapb-runtime" % "0.11.14",
       "com.typesafe.akka" %% "akka-persistence-query" % akkaVersion,
+      "org.iq80.leveldb" % "leveldb" % "0.12",
       guice,
+      "com.typesafe.akka" %% "akka-actor-testkit-typed" % akkaVersion % Test,
+      "com.typesafe.akka" %% "akka-persistence-testkit" % akkaVersion % Test,
       "org.scalatestplus.play" %% "scalatestplus-play" % "5.1.0" % Test
     ),
     Compile / PB.targets := Seq(

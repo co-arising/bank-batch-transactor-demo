@@ -1,6 +1,7 @@
 package net.imadz.m25.bank
 
 import net.imadz.m25.component._
+import net.imadz.monarch.persistence.PersistentMonarch
 import org.scalatest.funsuite.AnyFunSuite
 
 import scala.concurrent.duration._
@@ -30,6 +31,15 @@ class LedgerRecoverySpec extends AnyFunSuite {
 
   private def ent(chain: String, round: Int, bytes: Array[Byte], ts: Long = 1L) =
     ("r1", chain, round, 0, ts, Some(bytes))
+
+  test("journal persistence id preserves the bank entity prefix") {
+    val key = BatchKey.encode("abc", "recharge", 1, 0)
+    assert(LedgerRecovery.decodePersistenceId(LedgerRecovery.JournalNamespace + key) ==
+      (("abc", "recharge", 1, 0)))
+    intercept[IllegalArgumentException] {
+      LedgerRecovery.decodePersistenceId("other-executor|" + key)
+    }
+  }
 
   test("rebuild: single round Success -> credited") {
     val r = LedgerRecovery.rebuild(Seq(ent("recharge", 1, snap("recharge", 1, Success("c1", "c1")))))
@@ -71,6 +81,30 @@ class LedgerRecoverySpec extends AnyFunSuite {
 
   test("rebuild: empty entities -> empty ledger") {
     assert(LedgerRecovery.rebuild(Seq.empty) == LedgerRecovery.RecoveredLedger.empty)
+  }
+
+  test("journal snapshots: clean and resolved checkpoints replace started state; terminal events retain it") {
+    val initial = snap("recharge", 1)
+    val done = snap("recharge", 1, Success("c1", "c1"))
+    val resolved = snap("recharge", 1, Failure("c1", FailureReason("BALANCE_INSUFFICIENT", "x", None)))
+    val events = Seq(
+      PersistentMonarch.RunStarted("r1", Vector("classify#0", "resolve#1"), initial),
+      PersistentMonarch.StageDone("classify#0", 1L, Map.empty, done),
+      PersistentMonarch.StageResolved("resolve#1", 2L, Some("RESOLVED"), "RESOLVED", "policy result", resolved),
+      PersistentMonarch.RunCompleted("r1")
+    )
+    val latest = events.foldLeft(Option.empty[Array[Byte]]) { (previous, event) =>
+      LedgerRecovery.snapshotFromEvent(event, previous)
+    }
+    assert(latest.get.toSeq == resolved.toSeq)
+    assert(LedgerRecovery.rebuild(Seq(ent("recharge", 1, latest.get))).terminals(("recharge", "c1")) == "rejected")
+    assert(LedgerRecovery.snapshotFromEvent(events.head, latest).get.toSeq == resolved.toSeq)
+  }
+
+  test("journal snapshots: RunStarted is a fallback and unrelated events do not create a snapshot") {
+    val initial = snap("recharge", 1)
+    assert(LedgerRecovery.snapshotFromEvent(PersistentMonarch.RunCompleted("r1"), None).isEmpty)
+    assert(LedgerRecovery.snapshotFromEvent(PersistentMonarch.RunStarted("r1", Vector.empty, initial), None).get.toSeq == initial.toSeq)
   }
 
   test("rebuild: entity without snapshot contributes nothing") {

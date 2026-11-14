@@ -4,7 +4,7 @@ import akka.actor.typed.ActorSystem
 import akka.persistence.query.PersistenceQuery
 import akka.persistence.query.journal.leveldb.scaladsl.LeveldbReadJournal
 import akka.stream.Materializer
-import akka.stream.scaladsl.Sink
+import akka.stream.scaladsl.{Sink, Source}
 import net.imadz.m25.component.{BankStateCodec, Classification}
 import net.imadz.monarch.persistence.PersistentMonarch
 
@@ -32,7 +32,13 @@ import scala.concurrent.{ExecutionContext, Future}
 object LedgerRecovery {
 
   /** journal 中本服务的 entity 前缀（A2 仲裁后的唯一 canonical 前缀）。 */
-  val JournalPrefix: String = "m25-chain-executor|bank-"
+  val JournalNamespace: String = "m25-chain-executor|"
+  val JournalPrefix: String = JournalNamespace + "bank-"
+
+  private[bank] def decodePersistenceId(pid: String): (String, String, Int, Int) = {
+    require(pid.startsWith(JournalPrefix), s"not a Bank chain persistence id: '$pid'")
+    BatchKey.decode(pid.stripPrefix(JournalNamespace))
+  }
 
   /** 恢复结果：终态映射 + 所有"已见"客户（entered 计数用）。 */
   case class RecoveredLedger(
@@ -54,7 +60,7 @@ object LedgerRecovery {
       val ours = ids.filter(_.startsWith(JournalPrefix))
       if (ours.isEmpty) Future.successful(RecoveredLedger.empty)
       else {
-        Future.sequence(ours.map(pid => readEntity(readJournal, pid))).map { entities =>
+        Source(ours.toVector).mapAsync(4)(pid => readEntity(readJournal, pid)).runWith(Sink.seq).map { entities =>
           val byRun = entities.groupBy(_._1)
           if (byRun.isEmpty) RecoveredLedger.empty
           else {
@@ -105,28 +111,32 @@ object LedgerRecovery {
 
   // -- journal IO --------------------------------------------------------
 
+  /** Both clean and policy-resolved checkpoints carry the new durable state.
+    * The Bank host currently has no failure policy, but ignoring a future
+    * StageResolved would silently retain an older snapshot during ledger replay.
+    */
+  private[bank] def snapshotFromEvent(event: Any, latest: Option[Array[Byte]]): Option[Array[Byte]] = event match {
+    case PersistentMonarch.StageDone(_, _, _, snap) => Some(snap)
+    case PersistentMonarch.StageResolved(_, _, _, _, _, snap) => Some(snap)
+    case PersistentMonarch.RunStarted(_, _, snap) if latest.isEmpty => Some(snap)
+    case _ => latest
+  }
+
   /** 读单个 entity 的事件：最新快照 + 该 entity 的最大事件时间戳。 */
   private def readEntity(
       readJournal: LeveldbReadJournal,
       pid: String
   )(implicit ec: ExecutionContext, mat: Materializer
   ): Future[(String, String, Int, Int, Long, Option[Array[Byte]])] = {
-    val (runId, chain, round, index) = BatchKey.decode(pid.stripPrefix(JournalPrefix))
-    readJournal.currentEventsByPersistenceId(pid, 0L, Long.MaxValue).runWith(Sink.seq).map {
-      envelopes =>
-        var maxTs = 0L
-        var latest: Option[Array[Byte]] = None
-        envelopes.foreach { env =>
-          maxTs = math.max(maxTs, env.timestamp)
-          env.event match {
-            case PersistentMonarch.StageDone(_, ts, _, snap) =>
-              maxTs = math.max(maxTs, ts); latest = Some(snap)
-            case PersistentMonarch.RunStarted(_, _, snap) =>
-              if (latest.isEmpty) latest = Some(snap)
-            case _ => ()
-          }
+    val (runId, chain, round, index) = decodePersistenceId(pid)
+    readJournal.currentEventsByPersistenceId(pid, 1L, Long.MaxValue)
+      .runFold((0L, Option.empty[Array[Byte]])) { case ((maxTs, latest), env) =>
+        val eventTimestamp = env.event match {
+          case PersistentMonarch.StageDone(_, ts, _, _) => ts
+          case PersistentMonarch.StageResolved(_, ts, _, _, _, _) => ts
+          case _ => 0L
         }
-        (runId, chain, round, index, maxTs, latest)
-    }
+        (math.max(maxTs, math.max(env.timestamp, eventTimestamp)), snapshotFromEvent(env.event, latest))
+      }.map { case (maxTs, latest) => (runId, chain, round, index, maxTs, latest) }
   }
 }
