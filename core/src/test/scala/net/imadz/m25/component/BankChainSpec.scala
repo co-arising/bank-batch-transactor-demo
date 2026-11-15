@@ -7,7 +7,6 @@ import org.scalatest.matchers.should.Matchers
 
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
-import scala.concurrent.duration._
 
 /** BankChain — the six-stage chain on Monarch. These specs pin the journal-compat
   * cursor vocabulary ("file-gen"...), the ack/poll failure classification, and the
@@ -62,6 +61,15 @@ class BankChainSpec extends AsyncWordSpec with Matchers {
           "start:poll#3", "done:poll#3",
           "start:parse#4", "done:parse#4",
           "start:classify#5", "done:classify#5"))
+      }
+    }
+
+    "run through the host builder API with the candidate engine" in {
+      BankChain.builder(stubPipeline()).build().process(freshState).map { result =>
+        result.lastStage shouldBe Some(BankStage.Classify)
+        result.classifications.get should have size 2
+        result.generatedFile shouldBe defined
+        result.receipt shouldBe defined
       }
     }
 

@@ -6,7 +6,7 @@ import akka.cluster.sharding.typed.scaladsl.ClusterSharding
 import akka.util.Timeout
 import javax.inject.{Inject, Singleton}
 import net.imadz.m25.component._
-import net.imadz.monarch.persistence.{PersistentMonarch, RunObserver}
+import net.imadz.monarch.persistence.{DurableRunObserver, PersistentMonarch}
 import play.api.Logging
 
 import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue}
@@ -347,19 +347,19 @@ class BankBatchDemoService @Inject()(
     )
   }
 
-  /** 最新快照缓存：onStageComplete 写入，onCompleted 取出做业务收尾（新 API 的 onCompleted 不带快照）。 */
+  /** 只缓存已提交的快照；终态通知之后才做业务收尾。 */
   private val latestSnapshots = new ConcurrentHashMap[String, ChainExecutionActor.BankState]()
 
   private def chainOfBatchId(batchId: String): String =
     BatchKey.chainOf(batchId)
 
-  private val unifiedObserver = new RunObserver[ChainExecutionActor.BankState] with Logging {
+  private val unifiedObserver = new DurableRunObserver[ChainExecutionActor.BankState] with Logging {
     override def onStart(runId: String): Unit = {
       val (chain, _, _) = parseBatchKey(runId)
       publish("batch-started", Map("chain" -> chain, "batchId" -> runId, "items" -> "?"))
     }
-    override def onStageComplete(cursor: String, metadata: Map[String, String],
-                                snapshot: ChainExecutionActor.BankState): Unit = {
+    override def onCheckpointCommitted(cursor: String, metadata: Map[String, String],
+                                       snapshot: ChainExecutionActor.BankState): Unit = {
       latestSnapshots.put(snapshot.batchId, snapshot)
       publish("stage-done", Map("chain" -> chainOfBatchId(snapshot.batchId), "cursor" -> cursor))
     }
@@ -529,6 +529,8 @@ class BankBatchDemoService @Inject()(
 
   /** A3：若本 JVM 已启动新 run，之前发起的账本恢复完成时直接丢弃（旧运行数据）。 */
   @volatile private var ledgerRecoveryStale = false
+  @volatile private var ledgerRecoveryStatus = "NOT_STARTED"
+  @volatile private var ledgerRecoveryFailure: Option[String] = None
 
   def initSharding(): Unit = synchronized {
     if (shardingInitialized) return
@@ -536,12 +538,27 @@ class BankBatchDemoService @Inject()(
     webChainTypeKey = WebChain.initSharding(sharding, _ => unifiedPipeline, _ => unifiedObserver)
     // A3: 终态账本是读模型——服务（重）启时从 journal 重建最新一次运行的账本。
     // 与 startRun 互斥：恢复完成时若本 JVM 已起了新 run，结果直接丢弃。
-    LedgerRecovery.recoverLatest(system).foreach { recovered =>
-      synchronized {
-        if (!ledgerRecoveryStale) applyRecoveredLedger(recovered)
-        else logger.info("[bank-demo] 账本恢复结果已过期（新 run 已启动），丢弃")
+    ledgerRecoveryStatus = "RECOVERING"
+    val recovery = try LedgerRecovery.recoverLatest(system)
+      catch { case scala.util.control.NonFatal(ex) => Future.failed(ex) }
+    recovery.onComplete {
+      case Success(recovered) => synchronized {
+        try {
+          if (!ledgerRecoveryStale) applyRecoveredLedger(recovered)
+          else logger.info("[bank-demo] 账本恢复结果已过期（新 run 已启动），丢弃")
+          ledgerRecoveryStatus = "READY"
+        } catch {
+          case scala.util.control.NonFatal(ex) => recordRecoveryFailure(ex)
+        }
       }
+      case Failure(ex) => synchronized { recordRecoveryFailure(ex) }
     }
+  }
+
+  private def recordRecoveryFailure(ex: Throwable): Unit = {
+    ledgerRecoveryFailure = Some(Option(ex.getMessage).getOrElse(ex.toString))
+    ledgerRecoveryStatus = "FAILED"
+    logger.error("[bank-demo] journal 恢复失败；新运行保持关闭", ex)
   }
 
   /** A3：把从 journal 恢复的账本写回内存（终态 + 异常池重建 + 计数器）。 */
@@ -564,7 +581,10 @@ class BankBatchDemoService @Inject()(
     feedAdd(s"[恢复] 从 journal 重建账本：${r.terminals.size} 笔终态，${r.seen.size} 笔已见")
   }
 
-  def startRun(): Map[String, Any] = {
+  def startRun(): Map[String, Any] = synchronized {
+    if (ledgerRecoveryStatus != "READY")
+      return Map("started" -> false, "recovery" -> ledgerRecoveryStatus,
+        "message" -> ledgerRecoveryFailure.getOrElse("正在确认 journal 历史，请稍后再启动"))
     if (runningCount.get() > 0 || queue.size() > 0)
       return Map("started" -> false, "message" -> "已有批量任务在运行")
     synchronized {
@@ -643,6 +663,8 @@ class BankBatchDemoService @Inject()(
   def statsJson: String = {
     import play.api.libs.json._
     Json.stringify(Json.obj(
+      "recovery" -> Json.obj("status" -> ledgerRecoveryStatus, "error" -> ledgerRecoveryFailure,
+        "financialStateDurable" -> false),
       "scale" -> Json.obj(
         "customers" -> TOTAL_CUSTOMERS, "batchSize" -> BATCH_SIZE,
         "batches" -> TOTAL_BATCHES, "concurrency" -> MAX_CONCURRENT_BATCHES),
